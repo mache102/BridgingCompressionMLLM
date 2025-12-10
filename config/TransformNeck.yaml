@@ -1,6 +1,6 @@
 model: "elic_llm"
 dataset: "imagenet"
-dataset_path: "/work/dataset/ILSVRC"
+dataset_path: "/home/ying/datasets/ILSVRC"
 
 epochs: 1
 num_workers:
@@ -12,14 +12,15 @@ seed: 42
 PYTORCH_CUDA_ALLOC_CONF:
 
 
-exp_name: "ComNeck"
+exp_name: "bcmllm"
 comet_apt_key: "CometML API Key"
 comet_project_name: "Comet Project Name"
 comet_workspace: "Comet Workspace"
 
-root: "ROOTPATH"
+root: "/home/ying/experiments/mllm/BridgingCompressionMLLM/runs/"
 resume_exp_key:
-checkpoint: "CHECKPOINTPATH"
+# comment out to train from scratch
+# checkpoint: "CHECKPOINTPATH"
 quality_level: 1
 
 sanity:            True

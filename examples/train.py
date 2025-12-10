@@ -30,6 +30,34 @@ import CLIP_modify.clip as clip_modify
 from adapter_model import Linear_Encoder
 warnings.filterwarnings("ignore")
 
+def count_parameters(model):
+    """Count trainable parameters in a model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def estimate_macs(model, input_shape, device):
+    """Estimate MACs using PyTorch's built-in profiler."""
+    try:
+        dummy_input = torch.randn(*input_shape).to(device)
+        
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            record_shapes=True,
+            with_flops=True
+        ) as prof:
+            with torch.no_grad():
+                _ = model(dummy_input)
+        
+        # Extract FLOPs from profiler
+        events = prof.key_averages()
+        total_flops = sum([event.flops for event in events if event.flops > 0])
+        
+        # MACs = FLOPs / 2 (approximately, for most operations)
+        macs = total_flops / 2.0
+        return macs
+    except Exception as e:
+        logging.warning(f"MACs estimation failed: {e}")
+        return 0.0
+
 
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
@@ -330,6 +358,8 @@ def train_clipcls_one_epoch(model, criterion_rd, criterion_clip_cls, train_datal
     avg_accu_top1 = AverageMeter()
     avg_accu_top5 = AverageMeter()
     avg_psnr    = AverageMeter()
+    avg_encode_time = AverageMeter()
+    avg_decode_time = AverageMeter()
 
     model.train()
     adapter.train()
@@ -364,10 +394,18 @@ def train_clipcls_one_epoch(model, criterion_rd, criterion_clip_cls, train_datal
         else:
             distortion = 100 * clip_criterion['clip_distill']
             loss_list = ['clip_distill']
-
-
+            
         total_loss = 11.52 * distortion
-        update_txt=f'[{i*len(images)}/{len(train_dataloader.dataset)}] epoch: {epoch} | Loss: {total_loss.item():.3f} | Bpp loss: {out_criterion["bpp_loss"].item():.4f} |  top1: {avg_accu_top1.avg:.4f} | Loss list: {loss_list} | lr: {optimizer.param_groups[-1]["lr"]}'
+    
+        # collect encode/decode times if model provides them
+        tdict = out_net.get('time', None)
+        enc = 0
+        dec = 0
+        if tdict is not None:
+            enc = float(tdict.get('g_a', tdict.get('y_enc', 0.0))) + float(tdict.get('h_a', tdict.get('z_enc', 0.0))) + float(tdict.get('g_s', tdict.get('y_dec', 0.0)))
+            dec = float(tdict.get('h_s', tdict.get('z_dec', 0.0))) + float(tdict.get('transform', tdict.get('params', 0.0)))
+            
+        update_txt=f'[{i*len(images)}/{len(train_dataloader.dataset)}] epoch: {epoch} | Loss: {total_loss.item():.3f} | Bpp loss: {out_criterion["bpp_loss"].item():.4f} |  top1: {avg_accu_top1.avg:.4f} | Loss list: {loss_list} | lr: {optimizer.param_groups[-1]["lr"]} | t_enc: {enc/len(images):.4f}s | t_dec: {dec/len(images):.4f}s'
 
         if "ComputeAllTok" not in args.exp_name:
             total_loss.backward()
@@ -390,22 +428,41 @@ def train_clipcls_one_epoch(model, criterion_rd, criterion_clip_cls, train_datal
             avg_accu_top1.update(accu['top1'], n = len(images))
             avg_accu_top5.update(accu['top5'], n = len(images))
             avg_clip_distill_loss.update(clip_criterion['clip_distill'].item(), n = len(images))
-
-        log = {
-            'train/total_loss':         avg_total_loss.avg,
-            'train/bpp loss':           avg_bpp_loss.avg,
-            'train/mse loss':           avg_mse_loss.avg,
-            'train/clip_cls loss':      avg_clip_cls_loss.avg,
-            'train/psnr':               avg_psnr.avg,
-            'train/accu top1':          avg_accu_top1.avg,
-            'train/accu top5':          avg_accu_top5.avg,
-            'train/clip_distill loss':  avg_clip_distill_loss.avg
-        } 
-
-        comet_experiment.log_metrics(log)
+            # collect encode/decode times if model provides them
+            # encoder = g_a + h_a + g_s; decoder = h_s
+            tdict = out_net.get('time', None)
+            if tdict is not None:
+                g_a_t = float(tdict.get('g_a', 0.0))
+                h_a_t = float(tdict.get('h_a', 0.0))
+                g_s_t = float(tdict.get('g_s', 0.0))
+                h_s_t = float(tdict.get('h_s', 0.0))
+                # encoder = g_a + h_a + g_s (per-image microseconds)
+                enc_per_image_us = (g_a_t + h_a_t + g_s_t) * 1e6 / max(1, len(images))
+                # decoder = h_s (per-image microseconds)
+                dec_per_image_us = h_s_t * 1e6 / max(1, len(images))
+                avg_encode_time.update(enc_per_image_us, n = len(images))
+                avg_decode_time.update(dec_per_image_us, n = len(images))
 
     torch.cuda.empty_cache()
     gc.collect()
+
+    # End-of-epoch logging (standard logging + Comet)
+    train_log = {
+        'train/total_loss':         avg_total_loss.avg,
+        'train/bpp loss':           avg_bpp_loss.avg,
+        'train/mse loss':           avg_mse_loss.avg,
+        'train/clip_cls loss':      avg_clip_cls_loss.avg,
+        'train/psnr':               avg_psnr.avg,
+        'train/accu top1':          avg_accu_top1.avg,
+        'train/accu top5':          avg_accu_top5.avg,
+        'train/clip_distill loss':  avg_clip_distill_loss.avg,
+        'train/avg_encode_time_us':  avg_encode_time.avg,
+        'train/avg_decode_time_us':  avg_decode_time.avg,
+    }
+    comet_experiment.log_metrics(train_log)
+    logging.info('Train epoch %d: total_loss=%.6f, bpp=%.6f, psnr=%.4f, top1=%.4f, encode_us=%.3f, decode_us=%.3f',
+                 epoch, avg_total_loss.avg, avg_bpp_loss.avg, avg_psnr.avg, avg_accu_top1.avg,
+                 avg_encode_time.avg, avg_decode_time.avg)
 
 
 def test_clipcls_epoch(epoch, test_dataloader, model, criterion_rd, criterion_clip_cls, comet_experiment, stage='test', args = None, sanity = False, adapter = None):
@@ -420,6 +477,8 @@ def test_clipcls_epoch(epoch, test_dataloader, model, criterion_rd, criterion_cl
     top5_avg     = AverageMeter()
     totalloss    = AverageMeter()
     psnr_avg     = AverageMeter() 
+    avg_encode_time = AverageMeter()
+    avg_decode_time = AverageMeter()
 
     count = 0 # for saving token
 
@@ -457,6 +516,31 @@ def test_clipcls_epoch(epoch, test_dataloader, model, criterion_rd, criterion_cl
             totalloss.update(total_loss, images.shape[0])
             clip_distill_loss.update(clip_criterion['clip_distill'], images.shape[0])
 
+            # collect encode/decode times: encoder=g_a+h_a+g_s, decoder=h_s
+            tdict = out_net.get('time', None)
+            if tdict is None:
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    inference_out = model.inference(images)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    tdict = inference_out.get('time', {})
+                except Exception:
+                    tdict = {}
+
+            if tdict:
+                g_a_t = float(tdict.get('g_a', 0.0))
+                h_a_t = float(tdict.get('h_a', 0.0))
+                g_s_t = float(tdict.get('g_s', 0.0))
+                h_s_t = float(tdict.get('h_s', 0.0))
+                # encoder = g_a + h_a + g_s (per-image microseconds)
+                enc_per_image_us = (g_a_t + h_a_t + g_s_t) * 1e6 / max(1, images.shape[0])
+                # decoder = h_s (per-image microseconds)
+                dec_per_image_us = h_s_t * 1e6 / max(1, images.shape[0])
+                avg_encode_time.update(enc_per_image_us, n = images.shape[0])
+                avg_decode_time.update(dec_per_image_us, n = images.shape[0])
+
 
             txt = f"epoch: {epoch} | {stage} | Total Loss: {totalloss.avg:.3f}  Bpp loss: {bpp_loss.avg:.4f} | top1: {top1_avg.avg:.3f} | Loss list: {loss_list}"
             tqdm_meter.set_postfix_str(txt)
@@ -473,11 +557,15 @@ def test_clipcls_epoch(epoch, test_dataloader, model, criterion_rd, criterion_cl
         f"{stage}/accu top1"         :top1_avg.avg,
         f"{stage}/accu top5"         :top5_avg.avg,
         f'{stage}/clip_distill loss':  clip_distill_loss.avg,
-        } 
+        f'{stage}/avg_encode_time_us':  avg_encode_time.avg,
+        f'{stage}/avg_decode_time_us':  avg_decode_time.avg,
+        }
 
 
     comet_experiment.log_metrics(log)
-
+    logging.info('%s epoch %d: total_loss=%.6f, bpp=%.6f, psnr=%.4f, top1=%.4f, encode_us=%.3f, decode_us=%.3f',
+                 stage, epoch, totalloss.avg, bpp_loss.avg, psnr_avg.avg, top1_avg.avg,
+                 avg_encode_time.avg, avg_decode_time.avg)
 
 
     return totalloss.avg
@@ -510,6 +598,7 @@ def parse_args(argv):
         '--checkpoint', 
         type=str,
     )
+    parser.add_argument('--statso', action='store_true', help='Whether to output model stats ONLY')
     args = parser.parse_args(remaining)
     return args
 
@@ -584,10 +673,65 @@ def main(argv):
     net = image_models[args.model](quality=ql)
     net = net.to(device)
 
+    # ⚠️ IMPORTANT: This freezes ALL parameters in the compression model (g_a, h_a, h_s, g_s)
+    # Only the adapter will have trainable parameters
     for k, p in net.named_parameters():
         p.requires_grad = False
 
+    # Log model architecture statistics once
+    logging.info("=" * 60)
+    logging.info("MODEL ARCHITECTURE STATISTICS (one-time measurement)")
+    logging.info("=" * 60)
+    
+    # Encoder components (g_a, h_a, g_s)
+    encoder_params = count_parameters(net.g_a) + count_parameters(net.h_a) + count_parameters(net.g_s)
+    logging.info(f"Encoder (g_a + h_a + g_s) trainable params: {encoder_params:,}")
+    
+    # Decoder component (h_s)
+    decoder_params = count_parameters(net.h_s)
+    logging.info(f"Decoder (h_s) trainable params: {decoder_params:,}")
+    
+    # Adapter
+    adapter_params = count_parameters(adapter)
+    logging.info(f"Adapter trainable params: {adapter_params:,}")
+    
+    # Estimate MACs for encoder components
+    dummy_input_shape = (1, 3, 256, 256)
+    g_a_macs = estimate_macs(net.g_a, dummy_input_shape, device)
+    if g_a_macs > 0:
+        logging.info(f"g_a MACs: {g_a_macs/1e9:.3f} GMACs")
+    
+    # h_a takes output of g_a (M channels)
+    h_a_input_shape = (1, net.M, 256//16, 256//16)  # after downsampling
+    h_a_macs = estimate_macs(net.h_a, h_a_input_shape, device)
+    if h_a_macs > 0:
+        logging.info(f"h_a MACs: {h_a_macs/1e9:.3f} GMACs")
+    
+    # h_s takes output of h_a (N channels)
+    h_s_input_shape = (1, net.N, 256//64, 256//64)
+    h_s_macs = estimate_macs(net.h_s, h_s_input_shape, device)
+    if h_s_macs > 0:
+        logging.info(f"h_s MACs (decoder): {h_s_macs/1e9:.3f} GMACs")
+    
+    # g_s takes output of quantized y (M channels)
+    g_s_input_shape = (1, net.M, 256//16, 256//16)
+    g_s_macs = estimate_macs(net.g_s, g_s_input_shape, device)
+    if g_s_macs > 0:
+        logging.info(f"g_s MACs: {g_s_macs/1e9:.3f} GMACs")
+        encoder_macs = g_a_macs + h_a_macs + g_s_macs
+        logging.info(f"Total Encoder MACs: {encoder_macs/1e9:.3f} GMACs")
+    
+    # Adapter MACs
+    adapter_input_shape = (1, in_features, 256//16, 256//16)
+    adapter_macs = estimate_macs(adapter, adapter_input_shape, device)
+    if adapter_macs > 0:
+        logging.info(f"Adapter MACs: {adapter_macs/1e9:.3f} GMACs")
+    
+    logging.info("=" * 60)
 
+    if (args.statso):
+        sys.exit(0)
+    
     optimizer, aux_optimizer = configure_optimizers(adapter, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.optimizer['adapter']['Milestones'], gamma=0.1)
 

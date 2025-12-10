@@ -1,6 +1,8 @@
 import math
 import torch
 import torch.nn as nn
+import time
+
 from torch import Tensor
 from compressai.entropy_models import GaussianConditional
 from compressai.ops import ste_round
@@ -189,17 +191,38 @@ class ELIC_LLM(CompressionModel):
                 nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x, noisequant=False):
+        import time
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        g_a_start = time.perf_counter()
         y = self.g_a(x)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        g_a_time = time.perf_counter() - g_a_start
+        
         B, C, H, W = y.size() ## The shape of y to generate the mask
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        h_a_start = time.perf_counter()
         z = self.h_a(y)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        h_a_time = time.perf_counter() - h_a_start
+        
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         if not noisequant:
             z_offset = self.entropy_bottleneck._get_medians()
             z_tmp = z - z_offset
             z_hat = ste_round(z_tmp) + z_offset
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        h_s_start = time.perf_counter()
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        h_s_time = time.perf_counter() - h_s_start
 
         anchor = torch.zeros_like(y).to(x.device)
         non_anchor = torch.zeros_like(y).to(x.device)
@@ -302,13 +325,25 @@ class ELIC_LLM(CompressionModel):
         else:
             llm_emb = None
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        g_s_start = time.perf_counter()
         x_hat = self.g_s(y_hat)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        g_s_time = time.perf_counter() - g_s_start
 
         return {
             "x_hat": x_hat,
             "y_hat": y_hat,
             "llm_emb": llm_emb,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "time": {
+                'g_a': g_a_time,
+                'h_a': h_a_time,
+                'h_s': h_s_time,
+                'g_s': g_s_time,
+            }
         }
 
     def load_state_dict(self, state_dict, strict):
@@ -440,7 +475,18 @@ class ELIC_LLM(CompressionModel):
 
         params_time = time.time() - params_start
         return {"strings": [y_strings, z_strings], "shape": z.size()[-2:],
-                "time": {'y_enc': y_enc, "z_enc": z_enc, "z_dec": z_dec, "params": params_time}}
+            "time": {
+                'y_enc': y_enc,
+                'z_enc': z_enc,
+                'z_dec': z_dec,
+                'params': params_time,
+                # standard keys for external aggregators
+                'g_a': y_enc,
+                'h_a': z_enc,
+                'h_s': z_dec,
+                'g_s': 0.0,
+                'transform': params_time,
+            }}
 
 
     def decompress(self, strings, shape):
@@ -452,7 +498,9 @@ class ELIC_LLM(CompressionModel):
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
         B, _, _, _ = z_hat.size()
 
+        z_dec_start = time.time()
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        z_dec = time.time() - z_dec_start
 
         y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
         y_strings = strings[0]
@@ -531,7 +579,13 @@ class ELIC_LLM(CompressionModel):
         x_hat = self.g_s(y_hat).clamp_(0, 1)
         y_dec = time.time() - y_dec_start
 
-        return {"x_hat": x_hat, "time":{"y_dec": y_dec}}
+        return {"x_hat": x_hat, "time":{
+            'y_dec': y_dec,
+            # standard keys
+            'g_s': y_dec,
+            'h_s': z_dec,
+            'transform': 0.0,
+        }}
 
     def inference(self, x):
         import time
@@ -638,7 +692,19 @@ class ELIC_LLM(CompressionModel):
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
-            "time": {'y_enc': y_enc, "y_dec": y_dec, "z_enc": z_enc, "z_dec": z_dec, "params":params_time}
+            "time": {
+                'y_enc': y_enc,
+                'y_dec': y_dec,
+                'z_enc': z_enc,
+                'z_dec': z_dec,
+                'params': params_time,
+                # standardized keys for aggregators
+                'g_a': y_enc,
+                'g_s': y_dec,
+                'h_a': z_enc,
+                'h_s': z_dec,
+                'transform': params_time,
+            }
         }
 
         """
