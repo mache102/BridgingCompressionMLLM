@@ -2,7 +2,7 @@ model: "elic_llm"
 dataset: "imagenet"
 dataset_path: "/work/dataset/ILSVRC"
 
-epochs: 60
+epochs: 1
 num_workers:
 batch_size: 32
 test_batch_size: 50
